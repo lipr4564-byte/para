@@ -1,7 +1,6 @@
 """
 Слой хранения данных (Repository) и доменной логики (Service).
 Использует aiosqlite в режиме WAL с контролем транзакций, индексацией и версионированием схемы.
-Включает автоустановку и встроенный асинхронный адаптер sqlite3 для совместимости с любым хостингом.
 """
 
 import asyncio
@@ -200,6 +199,7 @@ MIGRATIONS: Dict[int, List[str]] = {
             leader_id INTEGER NOT NULL,
             points INTEGER NOT NULL DEFAULT 30,
             seats INTEGER NOT NULL DEFAULT 0,
+            chancellery_msg_id INTEGER DEFAULT NULL,
             created_at TEXT NOT NULL
         );
         """,
@@ -262,6 +262,9 @@ MIGRATIONS: Dict[int, List[str]] = {
             FOREIGN KEY (party_id) REFERENCES parties(id) ON DELETE CASCADE
         );
         """
+    ],
+    2: [
+        "ALTER TABLE parties ADD COLUMN chancellery_msg_id INTEGER DEFAULT NULL;"
     ]
 }
 
@@ -333,7 +336,10 @@ class DatabaseManager:
         for ver in sorted(MIGRATIONS.keys()):
             if ver > current_ver:
                 for sql in MIGRATIONS[ver]:
-                    await self._conn.execute(sql)
+                    try:
+                        await self._conn.execute(sql)
+                    except Exception:
+                        pass
                 await self._conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?);",
                     (ver, datetime.now().isoformat())
@@ -730,6 +736,16 @@ async def update_party_program(party_id: str, new_program: str) -> Optional[dict
         await conn.execute(
             "UPDATE parties SET program = ? WHERE id = ?;",
             (clean_prog, party_id.upper())
+        )
+    return await get_party_by_id(party_id)
+
+
+async def set_party_chancellery_msg_id(party_id: str, msg_id: int) -> Optional[dict]:
+    """Сохраняет ID сообщения о регистрации партии в теме Канцелярии для последующего редактирования"""
+    async with db_manager.transaction() as conn:
+        await conn.execute(
+            "UPDATE parties SET chancellery_msg_id = ? WHERE id = ?;",
+            (msg_id, party_id.upper())
         )
     return await get_party_by_id(party_id)
 
