@@ -1,18 +1,97 @@
 """
 Слой хранения данных (Repository) и доменной логики (Service).
 Использует aiosqlite в режиме WAL с контролем транзакций, индексацией и версионированием схемы.
+Включает автоустановку и встроенный асинхронный адаптер sqlite3 для совместимости с любым хостингом.
 """
 
 import asyncio
 import json
 import os
 import re
+import sqlite3
+import subprocess
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
-import aiosqlite
+try:
+    import aiosqlite
+except ImportError:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "aiosqlite"])
+        import aiosqlite
+    except Exception:
+        class _AsyncCursor:
+            def __init__(self, cur: sqlite3.Cursor):
+                self._cur = cur
+                self.lastrowid = cur.lastrowid
+
+            async def fetchone(self):
+                return self._cur.fetchone()
+
+            async def fetchall(self):
+                return self._cur.fetchall()
+
+        class _ExecuteContext:
+            def __init__(self, conn: sqlite3.Connection, sql: str, params: tuple):
+                self._conn = conn
+                self._sql = sql
+                self._params = params
+                self._cur = None
+
+            def _run(self):
+                if self._cur is None:
+                    self._cur = _AsyncCursor(self._conn.execute(self._sql, self._params))
+                return self._cur
+
+            def __await__(self):
+                async def _coro():
+                    return self._run()
+                return _coro().__await__()
+
+            async def __aenter__(self):
+                return self._run()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                if self._cur is not None:
+                    self._cur._cur.close()
+
+        class _AsyncConnection:
+            def __init__(self, db_path: str, timeout: float = 10.0):
+                self._conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+
+            @property
+            def row_factory(self):
+                return self._conn.row_factory
+
+            @row_factory.setter
+            def row_factory(self, val):
+                self._conn.row_factory = val
+
+            def execute(self, sql: str, parameters: tuple = ()):
+                return _ExecuteContext(self._conn, sql, parameters)
+
+            async def commit(self):
+                self._conn.commit()
+
+            async def rollback(self):
+                self._conn.rollback()
+
+            async def close(self):
+                self._conn.close()
+
+        class _FallbackAioSqlite:
+            Row = sqlite3.Row
+            Connection = _AsyncConnection
+
+            @staticmethod
+            async def connect(db_path: str, timeout: float = 10.0):
+                return _AsyncConnection(db_path, timeout=timeout)
+
+        aiosqlite = _FallbackAioSqlite()
+
 from config import CFG
 
 
@@ -229,7 +308,6 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def transaction(self):
-        """Атомарная транзакция с защитой от гонок (race conditions)"""
         await self.connect()
         async with self._write_lock:
             await self._conn.execute("BEGIN IMMEDIATE;")
@@ -282,7 +360,7 @@ async def close_db():
     await db_manager.close()
 
 
-# ===================== РЕПОЗИТОРИЙ И СЕРВИСНЫЙ СЛОЙ =====================
+# ===================== НАСТРОЙКИ И СТАТУС БОТА =====================
 
 async def get_setting(key: str) -> str:
     await db_manager.connect()
@@ -302,6 +380,14 @@ async def set_setting(key: str, value) -> None:
             "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
             (key, str(value))
         )
+
+
+async def get_bot_status() -> str:
+    return await get_setting("bot_status")
+
+
+async def set_bot_status(status: str) -> None:
+    await set_setting("bot_status", status)
 
 
 async def get_all_settings() -> dict:
@@ -366,7 +452,6 @@ async def register_user_activity(user_id: int, username: str, full_name: str) ->
             """,
             (user_id, uname, fname, now, now)
         )
-        # Авто-привязка ID к распарсенному слоту по юзернейму или имени
         if uname:
             await conn.execute(
                 "UPDATE slots SET user_id = ?, full_name = ? WHERE LOWER(username) = LOWER(?);",
@@ -554,7 +639,6 @@ async def bind_user_slot_manual(user_id: int, flag: str, slot_name: str):
 
 
 async def try_record_rp_post(user_id: int, text_len: int) -> Optional[Tuple[int, Optional[str], int]]:
-    """Атомарно проверяет длину и кулдаун поста, начисляет +1 пост игроку и ПВ его партии."""
     st = await get_all_settings()
     if text_len < st["min_post_length"]:
         return None
@@ -639,6 +723,17 @@ async def get_user_party(user_id: int) -> Optional[dict]:
     return await get_party_by_id(u["party_id"])
 
 
+async def update_party_program(party_id: str, new_program: str) -> Optional[dict]:
+    """Обновление описания (программы) партии"""
+    clean_prog = Validator.validate_program(new_program)
+    async with db_manager.transaction() as conn:
+        await conn.execute(
+            "UPDATE parties SET program = ? WHERE id = ?;",
+            (clean_prog, party_id.upper())
+        )
+    return await get_party_by_id(party_id)
+
+
 async def create_pending_party(leader, name: str, tag: str, flag: str, program: str, invited_ids: List[int]) -> str:
     req_id = uuid.uuid4().hex[:8]
     async with db_manager.transaction() as conn:
@@ -669,7 +764,6 @@ async def get_pending_party(req_id: str) -> Optional[dict]:
 
 
 async def confirm_pending_party_member(req_id: str, user_id: int) -> Tuple[Optional[dict], bool]:
-    """Добавляет подтверждение участника. Возвращает (заявка, нужно_ли_отправить_админу)"""
     min_mem = await get_int_setting("min_party_members")
     async with db_manager.transaction() as conn:
         async with conn.execute("SELECT * FROM pending_parties WHERE req_id = ?;", (req_id,)) as cur:
@@ -845,7 +939,6 @@ async def get_all_bills() -> List[dict]:
 
 
 async def cast_bill_vote(bill_id: str, user_id: int, vote_type: str) -> Optional[dict]:
-    """Транзакционная запись голоса без возможности гонки данных"""
     if not str(bill_id).isdigit():
         return None
     bid = int(bill_id)
