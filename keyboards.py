@@ -1,121 +1,108 @@
 """
-Клавиатуры и текстовые шаблоны (Views) для бота Парламента Rise of Europe
+Слой представления (Presentation Layer):
+Отвечает исключительно за построение инлайн-клавиатур и форматирование HTML-шаблонов.
 """
 
 from html import escape
 from typing import Optional
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from premium_emoji import pe, btn
+from premium_emoji import btn, pe
 
-
-# ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ШАБЛОНЫ =====================
 
 def esc(text: str) -> str:
-    return escape(str(text or ""))
+    return escape(str(text))
 
 
-def _blockquote(text: str) -> str:
-    return f"<blockquote>{text}</blockquote>"
+def _blockquote(content: str) -> str:
+    return f"<blockquote>{content}</blockquote>"
 
 
 BILL_TYPES = {
-    "un": {
-        "name": "Резолюция ООН",
-        "cost": 20,
-        "majority": 50,
-    },
-    "mech": {
-        "name": "Поправка в механики",
-        "cost": 40,
-        "majority": 60,
-    },
-    "tribunal": {
-        "name": "Трибунал",
-        "cost": 50,
-        "majority": 66,
-    },
-    "poll": {
-        "name": "Опрос",
-        "cost": 10,
-        "majority": 50,
-    },
+    "un": {"name": "Резолюция ООН", "cost": 20, "majority": 51},
+    "mech": {"name": "Поправка в механики", "cost": 40, "majority": 65},
+    "tribunal": {"name": "Трибунал", "cost": 80, "majority": 75},
+    "poll": {"name": "Опрос", "cost": 10, "majority": 51},
 }
 
 
+# ===================== ШАБЛОНЫ СООБЩЕНИЙ (VIEWS) =====================
+
 class Views:
     RULES_TEXT = (
-        f"{pe('🌍')} <b>Положение о политических партиях и Парламенте Rise of Europe</b>\n\n"
-        f"<b>Статья 1. Общие положения</b>\n"
-        f"Парламент является высшим представительным и законодательным органом проекта Rise of Europe.\n\n"
-        f"<b>Статья 2. Право голоса</b>\n"
-        f"Голосовать могут игроки, занимающие официальные позиции (страны) и выполнившие ценз активности по РП-постам в новостнике.\n\n"
-        f"<b>Статья 3. Программа партии</b>\n"
-        f"Каждая партия обязана иметь программу (от 20 до 800 символов), описывающую её цели, взгляды и направления деятельности.\n\n"
-        f"<b>Статья 4 и 6. Выборы в Парламент</b>\n"
-        f"Всеобщие выборы проводятся периодически по истечении установленного числа вайпов. Мандаты распределяются пропорционально голосам избирателей.\n\n"
-        f"<b>Статья 5. Состав и регистрация партии</b>\n"
-        f"Для создания партии требуется подтверждение сооснователей и одобрение администрации проекта (@asdewrx / @Versaillee).\n\n"
-        f"<b>Статья 7. Политический вес (ПВ) и прекращение деятельности</b>\n"
-        f"7.1. Партии получают ПВ за РП-посты своих участников в новостнике и тратят их на выдвижение законопроектов.\n"
-        f"7.2. Администрация проекта вправе лишить партию государственной регистрации или наложить Вето на законопроект."
+        f"{pe('🌍')} <b>Положение о партиях и избирательном процессе Rise Of Europe</b>\n"
+        f"<i>Авторство: @Versaillee</i>\n\n"
+        f"<b>Статья 1. Регистрация политических партий</b>\n"
+        f"{_blockquote('1.1. Создание и регистрация политической партии осуществляются исключительно с согласия администрации проекта (@asdewrx / @Versaillee).\n1.2. Для подачи заявки на регистрацию необходимо обратиться к ответственному представителю администрации: @asdewrx / @Versaillee; отказ можно получить без причины.')}\n\n"
+        f"<b>Статья 2. Руководство партии</b>\n"
+        f"{_blockquote('2.1. Каждая зарегистрированная партия обязана иметь избранного или назначенного председателя (главу партии).\n2.2. Глава партии несёт ответственность за её внутреннюю организацию, представительство и соблюдение установленных правил.')}\n\n"
+        f"<b>Статья 3. Программа</b>\n"
+        f"{_blockquote('3.1. Каждая партия обязана иметь собственную программу развития.\n3.2. Программа должна содержать основные взгляды, цели, принципы и предполагаемые направления деятельности партии.')}\n\n"
+        f"<b>Статья 4. Избирательный процесс</b>\n"
+        f"{_blockquote('4.1. Все зарегистрированные партии имеют право принимать участие в проводимых на территории проекта выборах.\n4.2. Выборы проводятся с целью определения политического представительства партий и формирования органов власти.\n4.3. Порядок проведения выборов, условия участия и подсчёт голосов определяются администрацией проекта.')}\n\n"
+        f"<b>Статья 5. Минимальная численность партии</b>\n"
+        f"{_blockquote('5.1. Для официальной регистрации партия обязана иметь установленное минимальное количество участников.\n5.2. Конкретная минимальная численность определяется администрацией проекта и является обязательным условием сохранения регистрации.')}\n\n"
+        f"<b>Статья 6. Периодичность выборов</b>\n"
+        f"{_blockquote('6.1. Очередные выборы проводятся по истечении установленного количества вайпов.\n6.2. Количество вайпов между избирательными циклами определяется администрацией проекта.')}\n\n"
+        f"<b>Статья 7. Дополнительные положения</b>\n"
+        f"{_blockquote('7.1. Администрация оставляет за собой право отказать в регистрации партии в случае несоответствия установленным требованиям.\n7.2. Партия может быть лишена регистрации в случае длительного бездействия, фактического прекращения существования или систематического нарушения правил проекта.\n7.3. Администрация оставляет за собой право вносить изменения и дополнения в настоящий регламент.\n7.4. Все спорные вопросы подлежат рассмотрению администрацией проекта.')}"
     )
 
     @staticmethod
-    def format_bill(bill: dict, party: Optional[dict] = None) -> str:
-        binfo = BILL_TYPES.get(bill.get("category", "poll"), BILL_TYPES["poll"])
-        party_str = (
-            f"{party['flag']} <b>{esc(party['name'])}</b> [{esc(party['tag'])}]"
-            if party else "<b>Администрация / Внепартийный</b>"
-        )
-
-        status_map = {
-            "active": f"{pe('📢')} <b>Идёт голосование</b> (порог: {binfo['majority']}%)",
-            "passed": f"{pe('✅')} <b>Принят Парламентом</b>",
-            "rejected": f"{pe('❌')} <b>Отклонён</b>",
-            "vetoed": f"{pe('👑')} <b>Наложено ВЕТО администрации</b>",
-        }
-        status_text = status_map.get(bill.get("status", "active"), bill.get("status", "active"))
+    def format_bill(bill: dict, party: Optional[dict]) -> str:
+        btype = BILL_TYPES.get(bill["category"], BILL_TYPES["poll"])
+        party_title = f"{party['flag']} {esc(party['name'])}" if party else "Внепартийный"
 
         c_for = len(bill.get("votes_for", []))
         c_against = len(bill.get("votes_against", []))
         c_abstain = len(bill.get("votes_abstain", []))
+        total = c_for + c_against
+        pct = round((c_for / total) * 100, 1) if total > 0 else 0.0
+
+        status_map = {
+            "active": f"{pe('📢')} <b>Статус:</b> Идёт голосование",
+            "passed": f"{pe('✅')} <b>Статус:</b> Принят ({pct}%)",
+            "rejected": f"{pe('❌')} <b>Статус:</b> Отклонён ({pct}%)",
+            "vetoed": f"{pe('⛔')} <b>Статус:</b> Наложено Вето Владельца",
+        }
 
         return (
-            f"{pe('📋')} <b>Законопроект #{bill['id']} — {esc(binfo['name'])}</b>\n"
+            f"{pe('📋')} <b>Законопроект #{bill['id']}</b>\n"
             f"─────────────────────\n"
-            f"Автор: <b>{esc(bill.get('author_name', '?'))}</b> ({esc(bill.get('author_slot', '?'))})\n"
-            f"Партия: {party_str}\n"
-            f"Статус: {status_text}\n\n"
-            f"<b>Текст законопроекта:</b>\n"
+            f"Тип: <b>{btype['name']}</b>\n"
+            f"Партия: <b>{party_title}</b>\n"
+            f"Автор: <b>{esc(bill.get('author_name', '?'))}</b>\n\n"
+            f"<b>Содержание:</b>\n"
             f"{_blockquote(esc(bill.get('text', '')))}\n\n"
-            f"{pe('📊')} <b>Голоса:</b> За: <b>{c_for}</b> | Против: <b>{c_against}</b> | Воздержались: <b>{c_abstain}</b>"
+            f"<b>Голоса:</b>\n"
+            f"{_blockquote(f'За: {c_for} ({pct}%)\nПротив: {c_against}\nВоздержались: {c_abstain}')}\n\n"
+            f"{status_map.get(bill.get('status', 'active'), '')}"
         )
 
     @staticmethod
-    def format_chancellery_decree(bill: dict, party: Optional[dict] = None) -> str:
-        binfo = BILL_TYPES.get(bill.get("category", "poll"), BILL_TYPES["poll"])
-        party_str = (
-            f"{party['flag']} <b>{esc(party['name'])}</b> [{esc(party['tag'])}]"
-            if party else "<b>Администрация</b>"
-        )
+    def format_chancellery_decree(bill: dict, party: Optional[dict]) -> str:
+        btype = BILL_TYPES.get(bill["category"], BILL_TYPES["poll"])
+        party_title = f"{party['flag']} {esc(party['name'])}" if party else "Парламент"
         c_for = len(bill.get("votes_for", []))
         c_against = len(bill.get("votes_against", []))
         c_abstain = len(bill.get("votes_abstain", []))
 
         return (
             f"{pe('👑')} <b>КАНЦЕЛЯРИЯ RISE OF EUROPE</b>\n"
-            f"{pe('✅')} <b>Принят закон #{bill['id']} ({esc(binfo['name'])})</b>\n"
+            f"{pe('📋')} <b>Постановление Парламента #{bill['id']}</b>\n"
             f"─────────────────────\n"
-            f"Инициатор: <b>{esc(bill.get('author_name', '?'))}</b> ({esc(bill.get('author_slot', '?'))})\n"
-            f"Партия: {party_str}\n\n"
-            f"<b>Постановление:</b>\n"
+            f"Категория: <b>{btype['name']}</b>\n"
+            f"Инициатор: <b>{party_title}</b>\n"
+            f"Представитель: <b>{esc(bill.get('author_name', '?'))}</b>\n\n"
+            f"<b>Текст принятого акта:</b>\n"
             f"{_blockquote(esc(bill.get('text', '')))}\n\n"
-            f"Итоги голосования: За — <b>{c_for}</b>, Против — <b>{c_against}</b>, Воздержались — <b>{c_abstain}</b>."
+            f"<b>Результаты голосования:</b>\n"
+            f"{_blockquote(f'За: {c_for} | Против: {c_against} | Воздержались: {c_abstain}')}\n\n"
+            f"{pe('✅')} <b>Утверждено и вступило в законную силу.</b>"
         )
 
 
-# ===================== ГЛАВНОЕ МЕНЮ =====================
+# ===================== КЛАВИАТУРЫ =====================
 
 def main_menu_kb(is_admin: bool = False, election_active: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -141,8 +128,6 @@ def back_main_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ===================== ПАРТИИ =====================
-
 def party_menu_kb(has_party: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(btn("Список партий", "party_list", "📋"))
@@ -155,6 +140,14 @@ def party_menu_kb(has_party: bool = False) -> InlineKeyboardMarkup:
             btn("Вступить в партию", "party_join", "🔗"),
         )
     builder.row(btn("Назад", "back_main", "🔙"))
+    return builder.as_markup()
+
+
+def my_party_kb(can_edit: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if can_edit:
+        builder.row(btn("Изменить программу", "party_edit_program", "✏️"))
+    builder.row(btn("Назад", "party_menu", "🔙"))
     return builder.as_markup()
 
 
@@ -181,8 +174,6 @@ def party_admin_approve_kb(req_id: str) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-
-# ===================== ПАРЛАМЕНТ И ЗАКОНОПРОЕКТЫ =====================
 
 def parliament_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -228,9 +219,7 @@ def bill_vote_kb(bill: dict) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-# ===================== АДМИН-ПАНЕЛЬ =====================
-
-def admin_panel_kb(status: str = "on") -> InlineKeyboardMarkup:
+def admin_panel_kb(bot_status: str = "on") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(btn("🔄 Синхронизировать страны", "admin_sync"))
     builder.row(btn("📋 Список пользователей", "admin_users"))
@@ -244,7 +233,7 @@ def admin_panel_kb(status: str = "on") -> InlineKeyboardMarkup:
     builder.row(btn("📜 Посмотреть логи", "admin_logs"))
     builder.row(btn("⚠️ Сбросить сезон", "admin_wipe"))
 
-    if status == "on":
+    if bot_status == "on":
         builder.row(btn("🛑 Выключить бота", "admin_shutdown"))
     else:
         builder.row(btn("✅ Включить бота", "admin_start_bot"))
