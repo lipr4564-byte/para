@@ -1,6 +1,6 @@
 """
 Контроллер пользовательских сценариев Парламента, Партий и Выборов.
-Не содержит прямых SQL-запросов и верстки: вызывает методы сервисного слоя (database.py) и шаблоны (Views).
+Отображает ники и юзернеймы игроков в списках голосов и составах партий.
 """
 
 from aiogram import Router, F, Bot
@@ -17,7 +17,7 @@ from database import (
     get_all_settings, get_int_setting, is_owner, get_admin_ids,
     register_user_activity, get_user_data, get_all_users, find_user_by_query,
     parse_and_save_reg_text, get_user_slot, try_record_rp_post, can_user_vote,
-    get_all_parties, get_party_by_id, get_user_party,
+    get_all_parties, get_party_by_id, get_user_party, update_party_program,
     create_pending_party, get_pending_party, confirm_pending_party_member,
     finalize_pending_party, join_party_by_code, leave_or_remove_from_party,
     create_bill, get_bill, get_all_bills, cast_bill_vote, set_bill_status,
@@ -25,7 +25,7 @@ from database import (
 )
 from keyboards import (
     BILL_TYPES, Views, esc, _blockquote,
-    main_menu_kb, back_main_kb, party_menu_kb, back_party_kb,
+    main_menu_kb, back_main_kb, party_menu_kb, my_party_kb, back_party_kb,
     party_invite_confirm_kb, party_admin_approve_kb,
     parliament_menu_kb, bill_type_kb, bill_vote_kb
 )
@@ -44,8 +44,18 @@ class ParlStates(StatesGroup):
     waiting_party_flag = State()
     waiting_party_program = State()
     waiting_party_cofounders = State()
+    waiting_edit_program = State()
     waiting_join_code = State()
     waiting_bill_text = State()
+
+
+def format_nick(u: dict, fallback_id: int = 0) -> str:
+    """Форматирует ник игрока: Ник (@юзернейм) или просто Ник"""
+    fname = (u.get("full_name") or str(fallback_id)).strip()
+    uname = (u.get("username") or "").strip()
+    if uname:
+        return f"{fname} (@{uname})"
+    return fname
 
 
 async def check_member(bot: Bot, user_id: int) -> bool:
@@ -179,7 +189,7 @@ async def cb_my_profile(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"{pe('📍')} <b>Профиль игрока</b>\n\n"
-        f"Игрок: <b>{esc(user.full_name)}</b>\n"
+        f"Игрок: <b>{esc(format_nick(u_data, user.id))}</b>\n"
         f"Позиция: <b>{slot_str}</b>\n"
         f"Партия: <b>{party_str}</b>\n"
         f"РП-постов в новостнике: <b>{u_data.get('posts', 0)}</b>\n\n"
@@ -202,22 +212,21 @@ async def cb_top_stats(callback: CallbackQuery):
     users = await get_all_users()
     u_lines = []
     for u in [x for x in users if x.get("posts", 0) > 0][:10]:
-        s = await get_user_slot(u["user_id"], u.get("username", ""), u.get("full_name", ""))
-        label = f"{s['slot_flag']} {esc(s['slot_name'])}" if s else esc(u.get("full_name", "?"))
-        u_lines.append(f"{label} — <b>{u['posts']}</b> постов")
+        label = esc(format_nick(u, u["user_id"]))
+        u_lines.append(f"• {label} — <b>{u['posts']}</b> постов")
     u_block = "\n".join(u_lines) if u_lines else "Постов пока нет"
 
     await callback.message.edit_text(
         f"{pe('📊')} <b>Рейтинг актива Rise of Europe</b>\n\n"
         f"<b>Партии по Политическому Весу:</b>\n{_blockquote(p_block)}\n\n"
-        f"<b>Активные страны в новостнике:</b>\n{_blockquote(u_block)}",
+        f"<b>Активные игроки в новостнике:</b>\n{_blockquote(u_block)}",
         parse_mode="HTML",
         reply_markup=back_main_kb()
     )
     await callback.answer()
 
 
-# ===================== ПАРТИИ (СОЗДАНИЕ ЧЕРЕЗ СОГЛАСИЕ И ОДОБРЕНИЕ АДМИНА) =====================
+# ===================== ПАРТИИ (СОЗДАНИЕ, СПИСОК И РЕДАКТИРОВАНИЕ ПРОГРАММЫ) =====================
 
 @router.callback_query(F.data == "party_menu")
 async def cb_party_menu(callback: CallbackQuery, state: FSMContext):
@@ -246,15 +255,11 @@ async def cb_party_list(callback: CallbackQuery):
     blocks = []
     for p in parties:
         leader = await get_user_data(p["leader_id"]) or {}
-        leader_name = f"@{leader['username']}" if leader.get("username") else esc(leader.get("full_name", "?"))
+        leader_name = esc(format_nick(leader, p["leader_id"]))
         m_list = []
         for mid in p.get("members", []):
-            s = await get_user_slot(mid)
-            if s:
-                m_list.append(f"{s['slot_flag']} {esc(s['slot_name'])}")
-            else:
-                u = await get_user_data(mid) or {}
-                m_list.append(esc(u.get("full_name", str(mid))))
+            u = await get_user_data(mid) or {}
+            m_list.append(esc(format_nick(u, mid)))
 
         blocks.append(
             f"{p['flag']} <b>{esc(p['name'])}</b> [{esc(p['tag'])}]\n"
@@ -512,9 +517,8 @@ async def cb_party_invite_response(callback: CallbackQuery, bot: Bot):
         for mid in req["confirmed_ids"]:
             u = await get_user_data(mid) or {}
             s = await get_user_slot(mid)
-            s_txt = f"{s['slot_flag']} {s['slot_name']}" if s else "Без страны"
-            uname_txt = f"@{u['username']}" if u.get("username") else f"ID: {mid}"
-            member_lines.append(f"• <code>{esc(u.get('full_name', str(mid)))}</code> ({uname_txt}) — {esc(s_txt)}")
+            s_txt = f" — {s['slot_flag']} {s['slot_name']}" if s else ""
+            member_lines.append(f"• {esc(format_nick(u, mid))}{esc(s_txt)}")
 
         admin_msg = (
             f"🏛 <b>Заявка на регистрацию партии</b>\n\n"
@@ -584,6 +588,11 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
         except Exception:
             pass
 
+    member_nicks = []
+    for mid in req["confirmed_ids"]:
+        u = await get_user_data(mid) or {}
+        member_nicks.append(esc(format_nick(u, mid)))
+
     topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
     try:
         await bot.send_message(
@@ -595,7 +604,7 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
                 f"─────────────────────\n"
                 f"Партия: <b>{req['flag']} {esc(req['name'])}</b> [{esc(req['tag'])}]\n"
                 f"Председатель: <b>{esc(req['leader_name'])}</b> (@{req['leader_username'] or 'нет'})\n"
-                f"Численность состава: <b>{len(req['confirmed_ids'])} чел.</b>\n\n"
+                f"Состав ({len(member_nicks)} чел.): {', '.join(member_nicks)}\n\n"
                 f"<b>Программа партии:</b>\n{_blockquote(esc(req['program']))}\n\n"
                 f"{pe('✅')} <b>Зарегистрирована в соответствии с Положением о партиях ROE.</b>"
             ),
@@ -611,11 +620,12 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
     await callback.answer("✅ Одобрено!")
 
 
-# ===================== МОЯ ПАРТИЯ, ВСТУПЛЕНИЕ И ВЫХОД =====================
+# ===================== МОЯ ПАРТИЯ, РЕДАКТИРОВАНИЕ ПРОГРАММЫ, ВСТУПЛЕНИЕ И ВЫХОД =====================
 
 @router.callback_query(F.data == "party_my")
 async def cb_party_my(callback: CallbackQuery):
-    party = await get_user_party(callback.from_user.id)
+    user = callback.from_user
+    party = await get_user_party(user.id)
     if not party:
         await callback.answer("Ты не состоишь в партии!", show_alert=True)
         return
@@ -624,10 +634,10 @@ async def cb_party_my(callback: CallbackQuery):
     m_lines = []
     for mid in party["members"]:
         u = await get_user_data(mid) or {}
-        s = await get_user_slot(mid)
-        s_str = f"{s['slot_flag']} {esc(s['slot_name'])}" if s else "Без страны"
         role = "👑 Председатель" if mid == party["leader_id"] else "👤 Участник"
-        m_lines.append(f"{role}: <b>{esc(u.get('full_name', str(mid)))}</b> ({s_str})")
+        m_lines.append(f"{role}: <b>{esc(format_nick(u, mid))}</b>")
+
+    can_edit = (user.id == party["leader_id"]) or (await is_owner(user))
 
     await callback.message.edit_text(
         f"{party['flag']} <b>{esc(party['name'])} [{esc(party['tag'])}]</b>\n"
@@ -639,9 +649,65 @@ async def cb_party_my(callback: CallbackQuery):
         f"<b>Состав ({len(party['members'])}/{max_mem}):</b>\n"
         f"{_blockquote(chr(10).join(m_lines))}",
         parse_mode="HTML",
+        reply_markup=my_party_kb(can_edit=can_edit)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "party_edit_program")
+async def cb_party_edit_program(callback: CallbackQuery, state: FSMContext):
+    user = callback.from_user
+    party = await get_user_party(user.id)
+    if not party:
+        await callback.answer("Ты не состоишь в партии!", show_alert=True)
+        return
+
+    if user.id != party["leader_id"] and not await is_owner(user):
+        await callback.answer("⛔ Изменять программу может только председатель партии!", show_alert=True)
+        return
+
+    await state.update_data(edit_party_id=party["id"])
+    await state.set_state(ParlStates.waiting_edit_program)
+    await callback.message.edit_text(
+        f"{pe('✏️')} <b>Изменение программы партии «{esc(party['name'])}»</b>\n\n"
+        f"Текущая программа:\n{_blockquote(esc(party.get('program', '')))}\n\n"
+        f"Отправь новый текст программы партии (от 20 до 800 символов):",
+        parse_mode="HTML",
         reply_markup=back_party_kb()
     )
     await callback.answer()
+
+
+@router.message(ParlStates.waiting_edit_program, F.chat.type == ChatType.PRIVATE, F.text)
+async def handle_party_edit_program(message: Message, state: FSMContext, bot: Bot):
+    try:
+        new_prog = Validator.validate_program(message.text)
+    except ValidationError as e:
+        await message.answer(f"{pe('❌')} {e}", parse_mode="HTML")
+        return
+
+    data = await state.get_data()
+    pid = data.get("edit_party_id")
+    party = await update_party_program(pid, new_prog)
+    await state.clear()
+
+    if not party:
+        await message.answer("❌ Партия не найдена.", reply_markup=back_party_kb())
+        return
+
+    await send_log(
+        bot,
+        f"✏️ <b>Обновлена программа партии</b>\n"
+        f"Партия: <b>{party['flag']} {esc(party['name'])}</b>\n"
+        f"Изменил: <code>{esc(format_nick(await get_user_data(message.from_user.id) or {}, message.from_user.id))}</code>"
+    )
+
+    await message.answer(
+        f"{pe('✅')} <b>Программа партии «{esc(party['name'])}» успешно обновлена!</b>\n\n"
+        f"{_blockquote(esc(new_prog))}",
+        parse_mode="HTML",
+        reply_markup=party_menu_kb(has_party=True)
+    )
 
 
 @router.callback_query(F.data == "party_join")
@@ -842,6 +908,7 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
 
     u_data = await get_user_data(user.id) or {}
     pid = u_data.get("party_id")
+    author_nick = format_nick(u_data, user.id)
     slot = await get_user_slot(user.id, user.username or "", user.full_name or "")
     slot_str = f"{slot['slot_flag']} {slot['slot_name']}" if slot else "Администрация"
 
@@ -849,7 +916,7 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
         bill = await create_bill(
             party_id=pid,
             author_id=user.id,
-            author_name=user.full_name or str(user.id),
+            author_name=author_nick,
             author_slot=slot_str,
             category=bkey,
             text=text,
@@ -886,7 +953,7 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
     )
 
 
-# ===================== ГОЛОСОВАНИЕ ПО ЗАКОНОПРОЕКТУ =====================
+# ===================== ГОЛОСОВАНИЕ ПО ЗАКОНОПРОЕКТУ (НИКИ В СПИСКЕ ГОЛОСОВ) =====================
 
 @router.callback_query(F.data.startswith("vote_"))
 async def cb_vote(callback: CallbackQuery):
@@ -926,12 +993,8 @@ async def cb_votes_list(callback: CallbackQuery):
     async def _fmt(uid_list):
         items = []
         for u_id in uid_list:
-            s = await get_user_slot(u_id)
-            if s:
-                items.append(f"{s['slot_flag']} {s['slot_name']}")
-            else:
-                u = await get_user_data(u_id) or {}
-                items.append(u.get("full_name", str(u_id)))
+            u = await get_user_data(u_id) or {}
+            items.append(format_nick(u, u_id))
         return ", ".join(items) if items else "нет"
 
     info = (
