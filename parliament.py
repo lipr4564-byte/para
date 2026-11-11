@@ -1235,4 +1235,161 @@ async def cb_bill_finish(callback: CallbackQuery, bot: Bot):
         return
 
     updated_bill = await finalize_bill_voting(bot, bill)
-    party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") el
+    party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") else None
+    try:
+        await callback.message.edit_text(
+            Views.format_bill(updated_bill, party),
+            parse_mode="HTML",
+            reply_markup=bill_vote_kb(updated_bill)
+        )
+    except Exception:
+        pass
+
+    await callback.answer("✅ Итоги подведены!", show_alert=True)
+
+
+# ===================== ВЫБОРЫ В ПАРЛАМЕНТ (СТАТЬЯ 4 И 6) =====================
+
+@router.callback_query(F.data == "election_menu")
+async def cb_election_menu(callback: CallbackQuery):
+    st = await get_all_settings()
+    if not st["election_active"]:
+        await callback.answer("Сейчас выборы не проводятся!", show_alert=True)
+        return
+
+    parties = await get_all_parties()
+    min_mem = st["min_party_members"]
+    valid_parties = [p for p in parties if len(p.get("members", [])) >= min_mem]
+
+    if not valid_parties:
+        await callback.answer("Нет партий, допущенных к выборам!", show_alert=True)
+        return
+
+    votes = await get_election_votes()
+    builder = InlineKeyboardBuilder()
+    lines = []
+    for p in valid_parties:
+        v_count = sum(1 for v in votes.values() if v == p["id"])
+        lines.append(f"{p['flag']} <b>{esc(p['name'])}</b> [{esc(p['tag'])}] — Голосов: <b>{v_count}</b>")
+        builder.row(btn(f"{p['flag']} {p['name']} ({v_count})", f"elvote_{p['id']}"))
+
+    builder.row(btn("Назад", "back_main", "🔙"))
+
+    await callback.message.edit_text(
+        f"{pe('👑')} <b>Всеобщие выборы в Парламент Rise of Europe</b>\n\n"
+        f"Отдай свой голос за одну из зарегистрированных партий:\n\n"
+        f"{_blockquote(chr(10).join(lines))}",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bill_veto_"))
+async def cb_bill_veto(callback: CallbackQuery, bot: Bot):
+    if not await is_owner(callback.from_user):
+        await callback.answer("⛔ Только для администрации (@asdewrx / @Versaillee)!", show_alert=True)
+        return
+
+    bid = callback.data[len("bill_veto_"):]
+    bill = await set_bill_status(bid, "vetoed")
+    if not bill:
+        return
+
+    party = await get_party_by_id(bill["party_id"]) if bill.get("party_id") else None
+    try:
+        await callback.message.edit_text(
+            Views.format_bill(bill, party),
+            parse_mode="HTML",
+            reply_markup=bill_vote_kb(bill)
+        )
+    except Exception:
+        pass
+
+    await send_log(bot, f"👑 Наложено <b>ВЕТО</b> на законопроект #{bid}")
+    await callback.answer("👑 Наложено Вето!", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bill_finish_"))
+async def cb_bill_finish(callback: CallbackQuery, bot: Bot):
+    if not await is_owner(callback.from_user):
+        await callback.answer("⛔ Подвести итог голосования может только администрация!", show_alert=True)
+        return
+
+    bid = callback.data[len("bill_finish_"):]
+    bill = await get_bill(bid)
+    if not bill or bill.get("status") != "active":
+        return
+
+    updated_bill = await finalize_bill_voting(bot, bill)
+    party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") else None
+    try:
+        await callback.message.edit_text(
+            Views.format_bill(updated_bill, party),
+            parse_mode="HTML",
+            reply_markup=bill_vote_kb(updated_bill)
+        )
+    except Exception:
+        pass
+
+    await callback.answer("✅ Итоги подведены!", show_alert=True)
+
+
+# ===================== ВЫБОРЫ В ПАРЛАМЕНТ (СТАТЬЯ 4 И 6) =====================
+
+@router.callback_query(F.data == "election_menu")
+async def cb_election_menu(callback: CallbackQuery):
+    st = await get_all_settings()
+    if not st["election_active"]:
+        await callback.answer("Сейчас выборы не проводятся!", show_alert=True)
+        return
+
+    parties = await get_all_parties()
+    min_mem = st["min_party_members"]
+    valid_parties = [p for p in parties if len(p.get("members", [])) >= min_mem]
+
+    if not valid_parties:
+        await callback.answer("Нет партий, допущенных к выборам!", show_alert=True)
+        return
+
+    votes = await get_election_votes()
+    builder = InlineKeyboardBuilder()
+    lines = []
+    for p in valid_parties:
+        v_count = sum(1 for v in votes.values() if v == p["id"])
+        lines.append(f"{p['flag']} <b>{esc(p['name'])}</b> [{esc(p['tag'])}] — Голосов: <b>{v_count}</b>")
+        builder.row(btn(f"{p['flag']} {p['name']} ({v_count})", f"elvote_{p['id']}"))
+
+    builder.row(btn("Назад", "back_main", "🔙"))
+
+    await callback.message.edit_text(
+        f"{pe('👑')} <b>Всеобщие выборы в Парламент Rise of Europe</b>\n\n"
+        f"Отдай свой голос за одну из зарегистрированных партий:\n\n"
+        f"{_blockquote(chr(10).join(lines))}",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("elvote_"))
+async def cb_election_vote(callback: CallbackQuery):
+    pid = callback.data[len("elvote_"):]
+    user = callback.from_user
+
+    ok, reason, _ = await can_user_vote(user)
+    if not ok:
+        await callback.answer(reason, show_alert=True)
+        return
+
+    party = await get_party_by_id(pid)
+    if not party:
+        return
+
+    casted = await cast_election_vote(user.id, pid)
+    if not casted:
+        await callback.answer("Выборы уже завершены!", show_alert=True)
+        return
+
+    await callback.answer(f"✅ Твой голос за партию «{party['name']}» учтён!", show_alert=True)
+    await cb_election_menu(callback)
