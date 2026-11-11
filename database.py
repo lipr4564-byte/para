@@ -237,6 +237,8 @@ MIGRATIONS: Dict[int, List[str]] = {
             category TEXT NOT NULL,
             text TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
+            ends_at INTEGER NOT NULL DEFAULT 0,
+            chat_msg_id INTEGER DEFAULT NULL,
             created_at TEXT NOT NULL
         );
         """,
@@ -265,6 +267,10 @@ MIGRATIONS: Dict[int, List[str]] = {
     ],
     2: [
         "ALTER TABLE parties ADD COLUMN chancellery_msg_id INTEGER DEFAULT NULL;"
+    ],
+    3: [
+        "ALTER TABLE bills ADD COLUMN ends_at INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE bills ADD COLUMN chat_msg_id INTEGER DEFAULT NULL;"
     ]
 }
 
@@ -730,7 +736,6 @@ async def get_user_party(user_id: int) -> Optional[dict]:
 
 
 async def update_party_program(party_id: str, new_program: str) -> Optional[dict]:
-    """Обновление описания (программы) партии"""
     clean_prog = Validator.validate_program(new_program)
     async with db_manager.transaction() as conn:
         await conn.execute(
@@ -741,7 +746,6 @@ async def update_party_program(party_id: str, new_program: str) -> Optional[dict
 
 
 async def set_party_chancellery_msg_id(party_id: str, msg_id: int) -> Optional[dict]:
-    """Сохраняет ID сообщения о регистрации партии в теме Канцелярии для последующего редактирования"""
     async with db_manager.transaction() as conn:
         await conn.execute(
             "UPDATE parties SET chancellery_msg_id = ? WHERE id = ?;",
@@ -893,7 +897,7 @@ async def add_party_points(party_id: str, delta: int) -> Optional[dict]:
     return await get_party_by_id(party_id)
 
 
-# ===================== ЗАКОНОПРОЕКТЫ И ТРАНЗАКЦИОННОЕ ГОЛОСОВАНИЕ =====================
+# ===================== ЗАКОНОПРОЕКТЫ, ТАЙМЕР И ТРАНЗАКЦИОННОЕ ГОЛОСОВАНИЕ =====================
 
 async def _hydrate_bill(conn: aiosqlite.Connection, row: aiosqlite.Row) -> dict:
     b = dict(row)
@@ -914,9 +918,13 @@ async def create_bill(
     category: str,
     text: str,
     cost: int,
-    is_admin: bool
+    is_admin: bool,
+    duration_hours: int = 5
 ) -> dict:
-    now = datetime.now().isoformat()
+    duration_hours = max(5, int(duration_hours))
+    now_dt = datetime.now()
+    ends_at = int(now_dt.timestamp()) + (duration_hours * 3600)
+
     async with db_manager.transaction() as conn:
         if party_id and not is_admin:
             async with conn.execute("SELECT points FROM parties WHERE id = ?;", (party_id,)) as cur:
@@ -927,15 +935,55 @@ async def create_bill(
 
         cur = await conn.execute(
             """
-            INSERT INTO bills (party_id, author_id, author_name, author_slot, category, text, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'active', ?);
+            INSERT INTO bills (party_id, author_id, author_name, author_slot, category, text, status, ends_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?);
             """,
-            (party_id, author_id, author_name, author_slot, category, text, now)
+            (party_id, author_id, author_name, author_slot, category, text, ends_at, now_dt.isoformat())
         )
         bid = cur.lastrowid
         async with conn.execute("SELECT * FROM bills WHERE id = ?;", (bid,)) as bcur:
             brow = await bcur.fetchone()
         return await _hydrate_bill(conn, brow)
+
+
+async def set_bill_chat_msg_id(bill_id: str, msg_id: int) -> None:
+    if not str(bill_id).isdigit():
+        return
+    async with db_manager.transaction() as conn:
+        await conn.execute("UPDATE bills SET chat_msg_id = ? WHERE id = ?;", (msg_id, int(bill_id)))
+
+
+async def extend_bill_timer(bill_id: str, extra_hours: int = 5) -> Optional[dict]:
+    if not str(bill_id).isdigit():
+        return None
+    bid = int(bill_id)
+    extra_sec = max(5, int(extra_hours)) * 3600
+    now_ts = int(datetime.now().timestamp())
+
+    async with db_manager.transaction() as conn:
+        async with conn.execute("SELECT * FROM bills WHERE id = ? AND status = 'active';", (bid,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+
+        base_ts = max(now_ts, row["ends_at"] or now_ts)
+        new_ends = base_ts + extra_sec
+        await conn.execute("UPDATE bills SET ends_at = ? WHERE id = ?;", (new_ends, bid))
+
+        async with conn.execute("SELECT * FROM bills WHERE id = ?;", (bid,)) as cur2:
+            row2 = await cur2.fetchone()
+        return await _hydrate_bill(conn, row2)
+
+
+async def get_expired_active_bills() -> List[dict]:
+    now_ts = int(datetime.now().timestamp())
+    await db_manager.connect()
+    async with db_manager.conn.execute(
+        "SELECT * FROM bills WHERE status = 'active' AND ends_at > 0 AND ends_at <= ?;",
+        (now_ts,)
+    ) as cur:
+        rows = await cur.fetchall()
+    return [await _hydrate_bill(db_manager.conn, r) for r in rows]
 
 
 async def get_bill(bill_id: str) -> Optional[dict]:
