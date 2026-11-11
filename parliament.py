@@ -1,8 +1,9 @@
 """
 Контроллер пользовательских сценариев Парламента, Партий и Выборов.
-Автоматически редактирует сообщение о регистрации партии в теме Канцелярии при изменении программы или состава.
+Включает авто-закреп новых голосований, всплывающее окно списка голосов и фоновый таймер авто-завершения.
 """
 
+import asyncio
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -21,14 +22,15 @@ from database import (
     set_party_chancellery_msg_id,
     create_pending_party, get_pending_party, confirm_pending_party_member,
     finalize_pending_party, join_party_by_code, leave_or_remove_from_party,
-    create_bill, get_bill, get_all_bills, cast_bill_vote, set_bill_status,
+    create_bill, set_bill_chat_msg_id, extend_bill_timer, get_expired_active_bills,
+    get_bill, get_all_bills, cast_bill_vote, set_bill_status,
     cast_election_vote, get_election_votes
 )
 from keyboards import (
     BILL_TYPES, Views, esc, _blockquote,
     main_menu_kb, back_main_kb, party_menu_kb, my_party_kb, back_party_kb,
     party_invite_confirm_kb, party_admin_approve_kb,
-    parliament_menu_kb, bill_type_kb, bill_vote_kb
+    parliament_menu_kb, bill_type_kb, bill_duration_kb, bill_vote_kb
 )
 from logger import (
     log_start, log_post_counted, log_party_created,
@@ -59,8 +61,18 @@ def format_nick(u: dict, fallback_id: int = 0) -> str:
     return fname
 
 
+def format_popup_nick(u: dict, fallback_id: int = 0) -> str:
+    """Компактный ник для всплывающего окна (show_alert=True), чтобы помещался в лимит 200 символов"""
+    fname = (u.get("full_name") or "").strip()
+    uname = (u.get("username") or "").strip()
+    if fname:
+        return fname[:18]
+    if uname:
+        return f"@{uname[:16]}"
+    return str(fallback_id)
+
+
 async def build_party_chancellery_text(party: dict) -> str:
-    """Формирует текст свидетельства о регистрации партии в теме Канцелярии"""
     leader_u = await get_user_data(party["leader_id"]) or {}
     leader_str = esc(format_nick(leader_u, party["leader_id"]))
 
@@ -82,22 +94,37 @@ async def build_party_chancellery_text(party: dict) -> str:
     )
 
 
-async def sync_party_chancellery_post(bot: Bot, party: dict):
-    """Редактирует старое сообщение о партии в теме Канцелярии (без удаления и отправки нового)"""
-    msg_id = party.get("chancellery_msg_id")
-    if not msg_id:
-        return
+async def sync_party_chancellery_post(bot: Bot, party: dict) -> bool:
     text = await build_party_chancellery_text(party)
+    msg_id = party.get("chancellery_msg_id")
+    topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
+
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=GROUP_ID,
+                message_id=msg_id,
+                text=text,
+                parse_mode="HTML"
+            )
+            return True
+        except Exception as e:
+            if "message is not modified" in str(e):
+                return True
+            log.warning(f"Не удалось отредактировать старое сообщение {msg_id}: {e}")
+
     try:
-        await bot.edit_message_text(
+        sent = await bot.send_message(
             chat_id=GROUP_ID,
-            message_id=msg_id,
+            message_thread_id=topic_id,
             text=text,
             parse_mode="HTML"
         )
+        await set_party_chancellery_msg_id(party["id"], sent.message_id)
+        return True
     except Exception as e:
-        if "message is not modified" not in str(e):
-            log.warning(f"Не удалось отредактировать сообщение партии {party['id']} в Канцелярии (msg_id={msg_id}): {e}")
+        log.error(f"Ошибка отправки поста партии в Канцелярию: {e}")
+        return False
 
 
 async def check_member(bot: Bot, user_id: int) -> bool:
@@ -113,14 +140,67 @@ async def publish_to_chancellery(bot: Bot, bill: dict):
     text = Views.format_chancellery_decree(bill, party)
     topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=topic_id,
             text=text,
             parse_mode="HTML"
         )
+        try:
+            await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent.message_id, disable_notification=False)
+        except Exception:
+            pass
     except Exception as e:
         log.error(f"Ошибка публикации в Канцелярию ({topic_id}): {e}")
+
+
+async def finalize_bill_voting(bot: Bot, bill: dict) -> dict:
+    """Единая логика завершения голосования (вручную или автоматически по таймеру)"""
+    bid = bill["id"]
+    binfo = BILL_TYPES.get(bill["category"], BILL_TYPES["poll"])
+    c_for = len(bill.get("votes_for", []))
+    c_against = len(bill.get("votes_against", []))
+    total = c_for + c_against
+    pct = (c_for / total * 100) if total > 0 else 0
+
+    new_status = "passed" if (total > 0 and pct >= binfo["majority"]) else "rejected"
+    updated_bill = await set_bill_status(bid, new_status)
+
+    if new_status == "passed" and updated_bill:
+        await publish_to_chancellery(bot, updated_bill)
+
+    if updated_bill and updated_bill.get("chat_msg_id"):
+        party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") else None
+        try:
+            await bot.edit_message_text(
+                chat_id=GROUP_ID,
+                message_id=updated_bill["chat_msg_id"],
+                text=Views.format_bill(updated_bill, party),
+                parse_mode="HTML",
+                reply_markup=bill_vote_kb(updated_bill)
+            )
+        except Exception:
+            pass
+
+    return updated_bill
+
+
+async def bill_timer_scheduler(bot: Bot):
+    """Фоновый планировщик: каждые 30 секунд проверяет истёкшие голосования и автоматически закрывает их"""
+    while True:
+        try:
+            expired = await get_expired_active_bills()
+            for bill in expired:
+                updated = await finalize_bill_voting(bot, bill)
+                if updated:
+                    await send_log(
+                        bot,
+                        f"⏰ <b>Авто-завершение голосования по таймеру: #{updated['id']}</b>\n"
+                        f"Итог: <b>{updated['status']}</b>"
+                    )
+        except Exception as e:
+            log.error(f"Ошибка в планировщике таймеров голосований: {e}")
+        await asyncio.sleep(30)
 
 
 # ===================== МОНИТОРИНГ ГРУППЫ И НОВОСТНИКА (1376336) =====================
@@ -137,20 +217,6 @@ async def group_monitor(message: Message, bot: Bot):
     if message.reply_to_message:
         rep = message.reply_to_message
         rep_text = rep.text or rep.caption or ""
-
-        # Привязка старого сообщения партии в Канцелярии командой !партия КОД
-        if text.lower().startswith("!партия") and await is_owner(user):
-            parts = text.split()
-            if len(parts) >= 2:
-                pid = parts[1].strip().upper()
-                party = await set_party_chancellery_msg_id(pid, rep.message_id)
-                if party:
-                    await sync_party_chancellery_post(bot, party)
-                    await message.reply(f"{pe('✅')} Сообщение Канцелярии привязано к партии <b>{esc(party['name'])}</b> и обновлено!", parse_mode="HTML")
-                else:
-                    await message.reply("❌ Партия с таким кодом не найдена.")
-            return
-
         if (rep.from_user and rep.from_user.id == REG_BOT_ID) or "Занятые страны" in rep_text:
             count = await parse_and_save_reg_text(rep_text)
             if count > 0 and text.lower().startswith("!синк"):
@@ -282,7 +348,7 @@ async def cb_top_stats(callback: CallbackQuery):
     await callback.answer()
 
 
-# ===================== ПАРТИИ (СОЗДАНИЕ, СПИСОК И РЕДАКТИРОВАНИЕ ПРОГРАММЫ) =====================
+# ===================== ПАРТИИ =====================
 
 @router.callback_query(F.data == "party_menu")
 async def cb_party_menu(callback: CallbackQuery, state: FSMContext):
@@ -597,8 +663,6 @@ async def cb_party_invite_response(callback: CallbackQuery, bot: Bot):
                 log.error(f"Не удалось отправить заявку на партию админу {adm_id}: {e}")
 
 
-# ===================== ОДОБРЕНИЕ / ОТКЛОНЕНИЕ ПАРТИИ АДМИНИСТРАЦИЕЙ =====================
-
 @router.callback_query(F.data.startswith("papp_"))
 async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
     if not await is_owner(callback.from_user):
@@ -645,18 +709,8 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
         except Exception:
             pass
 
-    topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
     if party:
-        try:
-            sent = await bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=topic_id,
-                text=await build_party_chancellery_text(party),
-                parse_mode="HTML"
-            )
-            await set_party_chancellery_msg_id(pid, sent.message_id)
-        except Exception as e:
-            log.error(f"Не удалось отправить регистрацию партии в Канцелярию: {e}")
+        await sync_party_chancellery_post(bot, party)
 
     await callback.message.edit_text(
         callback.message.text + "\n\n✅ <b>Партия зарегистрирована</b>",
@@ -664,8 +718,6 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
     )
     await callback.answer("✅ Одобрено!")
 
-
-# ===================== МОЯ ПАРТИЯ, РЕДАКТИРОВАНИЕ ПРОГРАММЫ, ВСТУПЛЕНИЕ И ВЫХОД =====================
 
 @router.callback_query(F.data == "party_my")
 async def cb_party_my(callback: CallbackQuery):
@@ -697,6 +749,25 @@ async def cb_party_my(callback: CallbackQuery):
         reply_markup=my_party_kb(can_edit=can_edit)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "party_sync_chan")
+async def cb_party_sync_chan(callback: CallbackQuery, bot: Bot):
+    user = callback.from_user
+    party = await get_user_party(user.id)
+    if not party:
+        await callback.answer("Ты не состоишь в партии!", show_alert=True)
+        return
+
+    if user.id != party["leader_id"] and not await is_owner(user):
+        await callback.answer("⛔ Только для председателя партии или администрации!", show_alert=True)
+        return
+
+    ok = await sync_party_chancellery_post(bot, party)
+    if ok:
+        await callback.answer("✅ Пост партии в теме Канцелярии обновлён!", show_alert=True)
+    else:
+        await callback.answer("❌ Ошибка обновления поста в Канцелярии.", show_alert=True)
 
 
 @router.callback_query(F.data == "party_edit_program")
@@ -740,7 +811,6 @@ async def handle_party_edit_program(message: Message, state: FSMContext, bot: Bo
         await message.answer("❌ Партия не найдена.", reply_markup=back_party_kb())
         return
 
-    # Автоматически редактируем старое сообщение в Канцелярии!
     await sync_party_chancellery_post(bot, party)
 
     await send_log(
@@ -808,7 +878,7 @@ async def cb_party_leave(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await cb_party_menu(callback, state)
 
 
-# ===================== ЗАКОНОПРОЕКТЫ И ГОЛОСОВАНИЯ =====================
+# ===================== ЗАКОНОПРОЕКТЫ, ВЫБОР ВРЕМЕНИ И ГОЛОСОВАНИЯ =====================
 
 @router.callback_query(F.data == "parl_menu")
 async def cb_parl_menu(callback: CallbackQuery, state: FSMContext):
@@ -935,12 +1005,31 @@ async def cb_bill_type_select(callback: CallbackQuery, state: FSMContext):
             return
 
     await state.update_data(bill_type=bkey)
+    await callback.message.edit_text(
+        f"{pe('📅')} <b>Длительность голосования ({binfo['name']})</b>\n\n"
+        f"Выбери время проведения голосования (минимум 5 часов):\n"
+        f"<i>По истечении таймера бот автоматически подведёт итоги.</i>",
+        parse_mode="HTML",
+        reply_markup=bill_duration_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bdur_"))
+async def cb_bill_duration_select(callback: CallbackQuery, state: FSMContext):
+    hours = max(5, int(callback.data[len("bdur_"):]))
+    data = await state.get_data()
+    bkey = data.get("bill_type", "poll")
+    binfo = BILL_TYPES.get(bkey, BILL_TYPES["poll"])
+
+    await state.update_data(bill_duration=hours)
     await state.set_state(ParlStates.waiting_bill_text)
 
     await callback.message.edit_text(
         f"{pe('✏️')} <b>{binfo['name']}</b>\n"
         f"Стоимость выдвижения: <b>{binfo['cost']} ПВ</b>\n"
-        f"Порог принятия: <b>{binfo['majority']}%</b>\n\n"
+        f"Порог принятия: <b>{binfo['majority']}%</b>\n"
+        f"Время голосования: <b>{hours} ч.</b>\n\n"
         f"Напиши полный текст законопроекта и обоснование:",
         parse_mode="HTML",
         reply_markup=back_main_kb()
@@ -957,7 +1046,8 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
         return
 
     data = await state.get_data()
-    bkey = data["bill_type"]
+    bkey = data.get("bill_type", "poll")
+    duration_hours = data.get("bill_duration", 5)
     binfo = BILL_TYPES[bkey]
     user = message.from_user
     admin_flag = await is_owner(user)
@@ -977,7 +1067,8 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
             category=bkey,
             text=text,
             cost=binfo["cost"],
-            is_admin=admin_flag
+            is_admin=admin_flag,
+            duration_hours=duration_hours
         )
     except ValidationError as e:
         await message.answer(f"{pe('❌')} {e}", parse_mode="HTML")
@@ -991,25 +1082,34 @@ async def handle_bill_text(message: Message, state: FSMContext, bot: Bot):
     party = await get_party_by_id(pid) if pid else None
     topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=GROUP_ID,
             message_thread_id=topic_id,
             text=Views.format_bill(bill, party),
             parse_mode="HTML",
             reply_markup=bill_vote_kb(bill)
         )
+        await set_bill_chat_msg_id(bid, sent.message_id)
+        try:
+            await bot.pin_chat_message(
+                chat_id=GROUP_ID,
+                message_id=sent.message_id,
+                disable_notification=False
+            )
+        except Exception as pin_err:
+            log.warning(f"Не удалось закрепить сообщение голосования #{bid}: {pin_err}")
     except Exception as e:
         log.error(f"Ошибка отправки голосования в тему: {e}")
 
     st = await get_all_settings()
     await message.answer(
-        f"{pe('✅')} <b>Законопроект #{bid} выставлен на голосование!</b>",
+        f"{pe('✅')} <b>Законопроект #{bid} выставлен на голосование (таймер: {duration_hours} ч.) и закреплён!</b>",
         parse_mode="HTML",
         reply_markup=main_menu_kb(is_admin=admin_flag, election_active=st["election_active"])
     )
 
 
-# ===================== ГОЛОСОВАНИЕ ПО ЗАКОНОПРОЕКТУ (НИКИ В СПИСКЕ ГОЛОСОВ) =====================
+# ===================== ГОЛОСОВАНИЕ, ПРОДЛЕНИЕ И ВСПЛЫВАЮЩЕЕ ОКНО ГОЛОСОВ =====================
 
 @router.callback_query(F.data.startswith("vote_"))
 async def cb_vote(callback: CallbackQuery):
@@ -1041,29 +1141,61 @@ async def cb_vote(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("votes_list_"))
 async def cb_votes_list(callback: CallbackQuery):
+    """Всегда открывает всплывающее веб-окошко Telegram (show_alert=True) без отправки сообщений в чат"""
     bid = callback.data[len("votes_list_"):]
     bill = await get_bill(bid)
     if not bill:
+        await callback.answer("❌ Законопроект не найден", show_alert=True)
         return
 
     async def _fmt(uid_list):
         items = []
         for u_id in uid_list:
             u = await get_user_data(u_id) or {}
-            items.append(format_nick(u, u_id))
+            items.append(format_popup_nick(u, u_id))
         return ", ".join(items) if items else "нет"
 
     info = (
-        f"Голоса #{bid}:\n"
+        f"📊 Голоса #{bid}:\n\n"
         f"✅ За: {await _fmt(bill['votes_for'])}\n"
         f"❌ Против: {await _fmt(bill['votes_against'])}\n"
-        f"🤝 Воздержались: {await _fmt(bill['votes_abstain'])}"
+        f"🤝 Воздерж.: {await _fmt(bill['votes_abstain'])}"
     )
-    if len(info) > 195:
-        await callback.message.answer(f"<b>{esc(info)}</b>", parse_mode="HTML")
-        await callback.answer()
-    else:
-        await callback.answer(info, show_alert=True)
+    if len(info) > 198:
+        info = info[:195] + "..."
+
+    await callback.answer(info, show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bill_ext_"))
+async def cb_bill_extend(callback: CallbackQuery):
+    """Продление таймера голосования на +5 часов"""
+    user = callback.from_user
+    bid = callback.data[len("bill_ext_"):]
+    bill = await get_bill(bid)
+    if not bill or bill.get("status") != "active":
+        await callback.answer("⛔ Голосование уже закрыто!", show_alert=True)
+        return
+
+    if not await is_owner(user) and user.id != bill.get("author_id"):
+        await callback.answer("⛔ Продлить таймер может только администрация или автор законопроекта!", show_alert=True)
+        return
+
+    updated_bill = await extend_bill_timer(bid, extra_hours=5)
+    if not updated_bill:
+        return
+
+    party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") else None
+    try:
+        await callback.message.edit_text(
+            Views.format_bill(updated_bill, party),
+            parse_mode="HTML",
+            reply_markup=bill_vote_kb(updated_bill)
+        )
+    except Exception:
+        pass
+
+    await callback.answer("⏳ Голосование продлено на +5 часов!", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("bill_veto_"))
@@ -1102,86 +1234,5 @@ async def cb_bill_finish(callback: CallbackQuery, bot: Bot):
     if not bill or bill.get("status") != "active":
         return
 
-    binfo = BILL_TYPES.get(bill["category"], BILL_TYPES["poll"])
-    c_for = len(bill.get("votes_for", []))
-    c_against = len(bill.get("votes_against", []))
-    total = c_for + c_against
-    pct = (c_for / total * 100) if total > 0 else 0
-
-    new_status = "passed" if (total > 0 and pct >= binfo["majority"]) else "rejected"
-    bill = await set_bill_status(bid, new_status)
-
-    if new_status == "passed":
-        await publish_to_chancellery(bot, bill)
-
-    party = await get_party_by_id(bill["party_id"]) if bill.get("party_id") else None
-    try:
-        await callback.message.edit_text(
-            Views.format_bill(bill, party),
-            parse_mode="HTML",
-            reply_markup=bill_vote_kb(bill)
-        )
-    except Exception:
-        pass
-
-    await callback.answer("✅ Итоги подведены!", show_alert=True)
-
-
-# ===================== ВЫБОРЫ В ПАРЛАМЕНТ (СТАТЬЯ 4 И 6) =====================
-
-@router.callback_query(F.data == "election_menu")
-async def cb_election_menu(callback: CallbackQuery):
-    st = await get_all_settings()
-    if not st["election_active"]:
-        await callback.answer("Сейчас выборы не проводятся!", show_alert=True)
-        return
-
-    parties = await get_all_parties()
-    min_mem = st["min_party_members"]
-    valid_parties = [p for p in parties if len(p.get("members", [])) >= min_mem]
-
-    if not valid_parties:
-        await callback.answer("Нет партий, допущенных к выборам!", show_alert=True)
-        return
-
-    votes = await get_election_votes()
-    builder = InlineKeyboardBuilder()
-    lines = []
-    for p in valid_parties:
-        v_count = sum(1 for v in votes.values() if v == p["id"])
-        lines.append(f"{p['flag']} <b>{esc(p['name'])}</b> [{esc(p['tag'])}] — Голосов: <b>{v_count}</b>")
-        builder.row(btn(f"{p['flag']} {p['name']} ({v_count})", f"elvote_{p['id']}"))
-
-    builder.row(btn("Назад", "back_main", "🔙"))
-
-    await callback.message.edit_text(
-        f"{pe('👑')} <b>Всеобщие выборы в Парламент Rise of Europe</b>\n\n"
-        f"Отдай свой голос за одну из зарегистрированных партий:\n\n"
-        f"{_blockquote(chr(10).join(lines))}",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("elvote_"))
-async def cb_election_vote(callback: CallbackQuery):
-    pid = callback.data[len("elvote_"):]
-    user = callback.from_user
-
-    ok, reason, _ = await can_user_vote(user)
-    if not ok:
-        await callback.answer(reason, show_alert=True)
-        return
-
-    party = await get_party_by_id(pid)
-    if not party:
-        return
-
-    casted = await cast_election_vote(user.id, pid)
-    if not casted:
-        await callback.answer("Выборы уже завершены!", show_alert=True)
-        return
-
-    await callback.answer(f"✅ Твой голос за партию «{party['name']}» учтён!", show_alert=True)
-    await cb_election_menu(callback)
+    updated_bill = await finalize_bill_voting(bot, bill)
+    party = await get_party_by_id(updated_bill["party_id"]) if updated_bill.get("party_id") el
