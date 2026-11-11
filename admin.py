@@ -22,9 +22,11 @@ from database import (
     sync_slots_from_reg_file, parse_and_save_reg_text, get_user_slot,
     count_slots, bind_user_slot_manual,
     get_all_parties, get_party_by_id, delete_party_by_admin, add_party_points,
+    set_party_chancellery_msg_id,
     get_all_bills, get_election_votes, start_elections_db, finish_elections_db,
     wipe_parliament_season
 )
+from parliament import sync_party_chancellery_post
 from keyboards import admin_panel_kb, admin_settings_kb, back_to_admin_kb, _blockquote
 from logger import log_broadcast, log
 from premium_emoji import pe, btn
@@ -765,14 +767,69 @@ async def admin_start_bot(callback: CallbackQuery):
     await callback.answer("Бот включён")
 
 
+# ===================== БЫСТРЫЕ КОМАНДЫ В ГРУППЕ =====================
+
 @router.message(F.chat.id == GROUP_ID, F.text.startswith("!"))
-async def group_admin_commands(message: Message):
+async def group_admin_commands(message: Message, bot: Bot):
     if not await is_owner(message.from_user):
         return
 
     text = message.text.strip()
     cmd = text.lower()
 
+    # !синк (в ответ на список стран)
+    if cmd.startswith("!синк"):
+        if message.reply_to_message:
+            rep_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+            count = await parse_and_save_reg_text(rep_text)
+            if count > 0:
+                await message.reply(f"{pe('✅')} Синхронизировано позиций: <b>{count}</b>", parse_mode="HTML")
+                return
+        f_count = await sync_slots_from_reg_file()
+        if f_count > 0:
+            await message.reply(f"{pe('✅')} Синхронизировано из файла БД: <b>{f_count}</b> позиций", parse_mode="HTML")
+        else:
+            await message.reply("❌ Ответьте (reply) командой <code>!синк</code> на сообщение со списком стран от @RegistrationROEbot!", parse_mode="HTML")
+        return
+
+    # !партия (в ответ на сообщение о регистрации партии в Канцелярии)
+    if cmd.startswith("!партия"):
+        if not message.reply_to_message:
+            await message.reply("❌ Ответьте (reply) командой <code>!партия КОД</code> на сообщение о регистрации партии в Канцелярии!", parse_mode="HTML")
+            return
+
+        rep = message.reply_to_message
+        rep_text = (rep.text or rep.caption or "").lower()
+        parts = text.split(maxsplit=1)
+        query = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        parties = await get_all_parties()
+        matched_party = None
+
+        for p in parties:
+            if query:
+                if p["id"].lower() == query or p["tag"].lower() == query or query in p["name"].lower():
+                    matched_party = p
+                    break
+            else:
+                if p["name"].lower() in rep_text or f"[{p['tag'].lower()}]" in rep_text:
+                    matched_party = p
+                    break
+
+        if not matched_party:
+            await message.reply("❌ Партия не найдена. Укажите код или тег партии: <code>!партия КОД</code>", parse_mode="HTML")
+            return
+
+        updated_party = await set_party_chancellery_msg_id(matched_party["id"], rep.message_id)
+        if updated_party:
+            await sync_party_chancellery_post(bot, updated_party)
+            await message.reply(
+                f"{pe('✅')} Сообщение привязано к партии <b>{esc(updated_party['name'])}</b> [{esc(updated_party['tag'])}] и обновлено!",
+                parse_mode="HTML"
+            )
+        return
+
+    # !чсп
     if cmd.startswith("!чсп") and message.reply_to_message:
         target = message.reply_to_message.from_user
         if target:
@@ -782,6 +839,7 @@ async def group_admin_commands(message: Message):
             st = "забанен в Парламенте" if u.get("banned") else "разбанен в Парламенте"
             await message.reply(f"⚖️ <b>{esc(target.full_name)}</b>: <b>{st}</b>.", parse_mode="HTML")
 
+    # !иммун
     elif cmd.startswith("!иммун") and message.reply_to_message:
         target = message.reply_to_message.from_user
         if target:
@@ -791,6 +849,7 @@ async def group_admin_commands(message: Message):
             st = "выдан" if u.get("immune") else "снят"
             await message.reply(f"👑 Иммунитет к цензу постов для <b>{esc(target.full_name)}</b>: <b>{st}</b>.", parse_mode="HTML")
 
+    # !пв
     elif cmd.startswith("!пв") and message.reply_to_message:
         parts = text.split()
         if len(parts) >= 2:
