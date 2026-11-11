@@ -19,7 +19,7 @@ from database import (
     sync_slots_from_reg_file, leave_or_remove_from_party
 )
 from admin import router as admin_router
-from parliament import router as parl_router
+from parliament import router as parl_router, bill_timer_scheduler
 from logger import log, send_log
 
 
@@ -87,6 +87,9 @@ async def on_startup(bot: Bot):
     synced = await sync_slots_from_reg_file()
     if synced:
         log.info(f"Синхронизировано {synced} позиций из базы @RegistrationROEbot")
+
+    asyncio.create_task(bill_timer_scheduler(bot))
+    log.info("Фоновый планировщик таймеров голосований запущен")
 
     try:
         chat = await bot.get_chat(GROUP_ID)
