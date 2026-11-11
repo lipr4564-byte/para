@@ -4,6 +4,7 @@
 Полностью совместим с Python 3.10 / 3.11 / 3.12+.
 """
 
+from datetime import datetime
 from html import escape
 from typing import Optional
 from aiogram.types import InlineKeyboardMarkup
@@ -70,8 +71,18 @@ class Views:
         total = c_for + c_against
         pct = round((c_for / total) * 100, 1) if total > 0 else 0.0
 
+        timer_line = ""
+        ends_at = bill.get("ends_at", 0)
+        if bill.get("status") == "active" and ends_at and ends_at > 0:
+            now_ts = int(datetime.now().timestamp())
+            rem_sec = max(0, ends_at - now_ts)
+            rem_h = rem_sec // 3600
+            rem_m = (rem_sec % 3600) // 60
+            end_str = datetime.fromtimestamp(ends_at).strftime("%d.%m в %H:%M")
+            timer_line = f"\n{pe('📅')} <b>Авто-завершение:</b> {end_str} (осталось {rem_h} ч. {rem_m} мин.)"
+
         status_map = {
-            "active": f"{pe('📢')} <b>Статус:</b> Идёт голосование",
+            "active": f"{pe('📢')} <b>Статус:</b> Идёт голосование{timer_line}",
             "passed": f"{pe('✅')} <b>Статус:</b> Принят ({pct}%)",
             "rejected": f"{pe('❌')} <b>Статус:</b> Отклонён ({pct}%)",
             "vetoed": f"{pe('⛔')} <b>Статус:</b> Наложено Вето Владельца",
@@ -162,6 +173,7 @@ def my_party_kb(can_edit: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if can_edit:
         builder.row(btn("Изменить программу", "party_edit_program", "✏️"))
+        builder.row(btn("Обновить пост в Канцелярии", "party_sync_chan", "🔄"))
     builder.row(btn("Назад", "party_menu", "🔙"))
     return builder.as_markup()
 
@@ -209,6 +221,21 @@ def bill_type_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def bill_duration_kb() -> InlineKeyboardMarkup:
+    """Выбор длительности голосования (минимум 5 часов)"""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        btn("5 часов", "bdur_5", "📅"),
+        btn("12 часов", "bdur_12", "📅"),
+    )
+    builder.row(
+        btn("24 часа", "bdur_24", "📅"),
+        btn("48 часов", "bdur_48", "📅"),
+    )
+    builder.row(btn("Назад", "bill_propose", "🔙"))
+    return builder.as_markup()
+
+
 def bill_vote_kb(bill: dict) -> InlineKeyboardMarkup:
     bid = bill["id"]
     c_for = len(bill.get("votes_for", []))
@@ -226,6 +253,7 @@ def bill_vote_kb(bill: dict) -> InlineKeyboardMarkup:
             btn("Список голосов", f"votes_list_{bid}", "👥"),
         )
         builder.row(
+            btn("+5 часов", f"bill_ext_{bid}", "📅"),
             btn("Подвести итог", f"bill_finish_{bid}", "🎯"),
             btn("Вето", f"bill_veto_{bid}", "👑"),
         )
