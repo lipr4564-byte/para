@@ -1,6 +1,6 @@
 """
 Контроллер пользовательских сценариев Парламента, Партий и Выборов.
-Отображает ники и юзернеймы игроков в списках голосов и составах партий.
+Автоматически редактирует сообщение о регистрации партии в теме Канцелярии при изменении программы или состава.
 """
 
 from aiogram import Router, F, Bot
@@ -18,6 +18,7 @@ from database import (
     register_user_activity, get_user_data, get_all_users, find_user_by_query,
     parse_and_save_reg_text, get_user_slot, try_record_rp_post, can_user_vote,
     get_all_parties, get_party_by_id, get_user_party, update_party_program,
+    set_party_chancellery_msg_id,
     create_pending_party, get_pending_party, confirm_pending_party_member,
     finalize_pending_party, join_party_by_code, leave_or_remove_from_party,
     create_bill, get_bill, get_all_bills, cast_bill_vote, set_bill_status,
@@ -58,6 +59,47 @@ def format_nick(u: dict, fallback_id: int = 0) -> str:
     return fname
 
 
+async def build_party_chancellery_text(party: dict) -> str:
+    """Формирует текст свидетельства о регистрации партии в теме Канцелярии"""
+    leader_u = await get_user_data(party["leader_id"]) or {}
+    leader_str = esc(format_nick(leader_u, party["leader_id"]))
+
+    member_nicks = []
+    for mid in party.get("members", []):
+        u = await get_user_data(mid) or {}
+        member_nicks.append(esc(format_nick(u, mid)))
+
+    return (
+        f"{pe('👑')} <b>КАНЦЕЛЯРИЯ RISE OF EUROPE</b>\n"
+        f"{pe('🤝')} <b>Регистрация политической партии</b>\n"
+        f"─────────────────────\n"
+        f"Партия: <b>{party['flag']} {esc(party['name'])}</b> [{esc(party['tag'])}]\n"
+        f"Председатель: <b>{leader_str}</b>\n"
+        f"Состав ({len(member_nicks)} чел.): {', '.join(member_nicks)}\n\n"
+        f"<b>Программа партии:</b>\n"
+        f"<blockquote>{esc(party.get('program', ''))}</blockquote>\n\n"
+        f"{pe('✅')} <b>Зарегистрирована в соответствии с Положением о партиях ROE.</b>"
+    )
+
+
+async def sync_party_chancellery_post(bot: Bot, party: dict):
+    """Редактирует старое сообщение о партии в теме Канцелярии (без удаления и отправки нового)"""
+    msg_id = party.get("chancellery_msg_id")
+    if not msg_id:
+        return
+    text = await build_party_chancellery_text(party)
+    try:
+        await bot.edit_message_text(
+            chat_id=GROUP_ID,
+            message_id=msg_id,
+            text=text,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            log.warning(f"Не удалось отредактировать сообщение партии {party['id']} в Канцелярии (msg_id={msg_id}): {e}")
+
+
 async def check_member(bot: Bot, user_id: int) -> bool:
     try:
         m = await bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
@@ -95,6 +137,20 @@ async def group_monitor(message: Message, bot: Bot):
     if message.reply_to_message:
         rep = message.reply_to_message
         rep_text = rep.text or rep.caption or ""
+
+        # Привязка старого сообщения партии в Канцелярии командой !партия КОД
+        if text.lower().startswith("!партия") and await is_owner(user):
+            parts = text.split()
+            if len(parts) >= 2:
+                pid = parts[1].strip().upper()
+                party = await set_party_chancellery_msg_id(pid, rep.message_id)
+                if party:
+                    await sync_party_chancellery_post(bot, party)
+                    await message.reply(f"{pe('✅')} Сообщение Канцелярии привязано к партии <b>{esc(party['name'])}</b> и обновлено!", parse_mode="HTML")
+                else:
+                    await message.reply("❌ Партия с таким кодом не найдена.")
+            return
+
         if (rep.from_user and rep.from_user.id == REG_BOT_ID) or "Занятые страны" in rep_text:
             count = await parse_and_save_reg_text(rep_text)
             if count > 0 and text.lower().startswith("!синк"):
@@ -575,6 +631,7 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
         return
 
     pid = req["party_id"]
+    party = await get_party_by_id(pid)
     await log_party_created(bot, req["leader_id"], req["leader_username"], req["leader_name"], req["name"], req["tag"])
 
     for uid in req["confirmed_ids"]:
@@ -588,30 +645,18 @@ async def cb_party_admin_decision(callback: CallbackQuery, bot: Bot):
         except Exception:
             pass
 
-    member_nicks = []
-    for mid in req["confirmed_ids"]:
-        u = await get_user_data(mid) or {}
-        member_nicks.append(esc(format_nick(u, mid)))
-
     topic_id = await get_int_setting("chancellery_topic_id") or CHANCELLERY_TOPIC_ID
-    try:
-        await bot.send_message(
-            chat_id=GROUP_ID,
-            message_thread_id=topic_id,
-            text=(
-                f"{pe('👑')} <b>КАНЦЕЛЯРИЯ RISE OF EUROPE</b>\n"
-                f"{pe('🤝')} <b>Регистрация политической партии</b>\n"
-                f"─────────────────────\n"
-                f"Партия: <b>{req['flag']} {esc(req['name'])}</b> [{esc(req['tag'])}]\n"
-                f"Председатель: <b>{esc(req['leader_name'])}</b> (@{req['leader_username'] or 'нет'})\n"
-                f"Состав ({len(member_nicks)} чел.): {', '.join(member_nicks)}\n\n"
-                f"<b>Программа партии:</b>\n{_blockquote(esc(req['program']))}\n\n"
-                f"{pe('✅')} <b>Зарегистрирована в соответствии с Положением о партиях ROE.</b>"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    if party:
+        try:
+            sent = await bot.send_message(
+                chat_id=GROUP_ID,
+                message_thread_id=topic_id,
+                text=await build_party_chancellery_text(party),
+                parse_mode="HTML"
+            )
+            await set_party_chancellery_msg_id(pid, sent.message_id)
+        except Exception as e:
+            log.error(f"Не удалось отправить регистрацию партии в Канцелярию: {e}")
 
     await callback.message.edit_text(
         callback.message.text + "\n\n✅ <b>Партия зарегистрирована</b>",
@@ -695,6 +740,9 @@ async def handle_party_edit_program(message: Message, state: FSMContext, bot: Bo
         await message.answer("❌ Партия не найдена.", reply_markup=back_party_kb())
         return
 
+    # Автоматически редактируем старое сообщение в Канцелярии!
+    await sync_party_chancellery_post(bot, party)
+
     await send_log(
         bot,
         f"✏️ <b>Обновлена программа партии</b>\n"
@@ -703,7 +751,7 @@ async def handle_party_edit_program(message: Message, state: FSMContext, bot: Bo
     )
 
     await message.answer(
-        f"{pe('✅')} <b>Программа партии «{esc(party['name'])}» успешно обновлена!</b>\n\n"
+        f"{pe('✅')} <b>Программа партии «{esc(party['name'])}» обновлена в базе и в теме Канцелярии!</b>\n\n"
         f"{_blockquote(esc(new_prog))}",
         parse_mode="HTML",
         reply_markup=party_menu_kb(has_party=True)
@@ -730,7 +778,7 @@ async def cb_party_join(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(ParlStates.waiting_join_code, F.chat.type == ChatType.PRIVATE, F.text)
-async def handle_party_join_code(message: Message, state: FSMContext):
+async def handle_party_join_code(message: Message, state: FSMContext, bot: Bot):
     code = message.text.strip().upper()
     ok, err_msg, party = await join_party_by_code(message.from_user.id, code)
     if not ok:
@@ -738,6 +786,8 @@ async def handle_party_join_code(message: Message, state: FSMContext):
         return
 
     await state.clear()
+    await sync_party_chancellery_post(bot, party)
+
     await message.answer(
         f"{pe('✅')} Ты вступил в партию <b>{party['flag']} {esc(party['name'])}</b>!",
         parse_mode="HTML",
@@ -746,8 +796,14 @@ async def handle_party_join_code(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "party_leave")
-async def cb_party_leave(callback: CallbackQuery, state: FSMContext):
+async def cb_party_leave(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    old_party = await get_user_party(callback.from_user.id)
     await leave_or_remove_from_party(callback.from_user.id)
+    if old_party:
+        updated_party = await get_party_by_id(old_party["id"])
+        if updated_party:
+            await sync_party_chancellery_post(bot, updated_party)
+
     await callback.answer("Ты покинул партию.", show_alert=True)
     await cb_party_menu(callback, state)
 
