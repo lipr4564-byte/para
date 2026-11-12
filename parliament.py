@@ -331,14 +331,12 @@ async def cb_top_stats(callback: CallbackQuery):
     parties = await get_all_parties()
     bills = await get_all_bills()
 
-    # Считаем сколько полезных законов приняла каждая партия
     passed_by_party = {}
     for b in bills:
         if b.get("status") == "passed" and b.get("party_id"):
             pid = b["party_id"]
             passed_by_party[pid] = passed_by_party.get(pid, 0) + 1
 
-    # Сортируем партии: 1) по принятым законам, 2) по мандатам, 3) по очкам ПВ
     parties.sort(
         key=lambda p: (passed_by_party.get(p["id"], 0), p.get("seats", 0), p.get("points", 0)),
         reverse=True
@@ -348,10 +346,10 @@ async def cb_top_stats(callback: CallbackQuery):
     for idx, p in enumerate(parties[:10], 1):
         laws_c = passed_by_party.get(p["id"], 0)
         p_lines.append(
-            f"{idx}. {p['flag']} <b>{esc(p['name'])}</b> — "
-            f"📜 Законов: <b>{laws_c}</b> | 💎 <b>{p.get('points', 0)} ПВ</b> ({len(p.get('members', []))} уч.)"
+            f"{idx}. {p['flag']} <b>{esc(p['name'])}:</b>\n"
+            f"Законов: <b>{laws_c}</b> | <b>{p.get('points', 0)} ПВ</b> ({len(p.get('members', []))} уч.)"
         )
-    p_block = "\n".join(p_lines) if p_lines else "Партий пока нет"
+    p_block = "\n\n".join(p_lines) if p_lines else "Партий пока нет"
 
     users = await get_all_users()
     u_lines = []
@@ -361,8 +359,8 @@ async def cb_top_stats(callback: CallbackQuery):
     u_block = "\n".join(u_lines) if u_lines else "Постов пока нет"
 
     await callback.message.edit_text(
-        f"{pe('📊')} <b>Рейтинг эффективности и актива Rise of Europe</b>\n\n"
-        f"<b>Партии (по принятым законам и весу):</b>\n{_blockquote(p_block)}\n\n"
+        f"{pe('📊')} <b>Рейтинг актива Rise of Europe</b>\n\n"
+        f"<b>Партии:</b>\n{_blockquote(p_block)}\n\n"
         f"<b>Активные игроки в новостнике:</b>\n{_blockquote(u_block)}",
         parse_mode="HTML",
         reply_markup=back_main_kb()
